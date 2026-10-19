@@ -1,5 +1,5 @@
 
-const CARD_VERSION = "1.1.0";
+const CARD_VERSION = "0.2.0";
 const CARD_TAG = "sentinel-chat-card";
 const LEGACY_CARD_TAG = "k93-ans-chat-card";
 
