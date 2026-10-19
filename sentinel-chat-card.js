@@ -1,5 +1,7 @@
 
-const CARD_VERSION = "0.1.0";
+const CARD_VERSION = "1.1.0";
+const CARD_TAG = "sentinel-chat-card";
+const LEGACY_CARD_TAG = "k93-ans-chat-card";
 
 const LOCALE_TAG = { en: "en", no: "nb-NO" };
 
@@ -73,10 +75,51 @@ function formatRelativeTime(iso, locale, lang) {
   return `${capitalizedWeekday} ${time}`;
 }
 
-class K93AnsChatCard extends HTMLElement {
+const WS_PREFIXES = ["sentinel", "k93_ans"];
+let wsPrefix = null;
+
+class SentinelApi {
+  constructor() {
+    this.hass = null;
+  }
+
+  async _withPrefix(fn) {
+    if (wsPrefix) return fn(wsPrefix);
+    let lastError;
+    for (const prefix of WS_PREFIXES) {
+      try {
+        const result = await fn(prefix);
+        wsPrefix = prefix;
+        return result;
+      } catch (err) {
+        if (err?.code !== "unknown_command") throw err;
+        lastError = err;
+      }
+    }
+    throw lastError;
+  }
+
+  call(name, params = {}) {
+    return this._withPrefix((prefix) => this.hass.callWS({ ...params, type: `${prefix}/${name}` }));
+  }
+
+  subscribe(name, onEvent, params = {}) {
+    return this._withPrefix((prefix) =>
+      this.hass.connection.subscribeMessage(onEvent, { ...params, type: `${prefix}/${name}` })
+    );
+  }
+}
+
+function defineElement(tag, ctor) {
+  if (!customElements.get(tag)) customElements.define(tag, ctor);
+}
+
+class SentinelChatCard extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
+    this._api = new SentinelApi();
+    this._onReconnect = () => this._refresh();
     this._rooms = [];
     this._activeRoomId = null;
     this._messages = [];
@@ -93,6 +136,7 @@ class K93AnsChatCard extends HTMLElement {
   }
 
   setConfig(config) {
+    const previousRoom = this._config?.chatroom_id;
     this._config = {
       chatroom_id: "",
       language: "auto",
@@ -101,14 +145,24 @@ class K93AnsChatCard extends HTMLElement {
       ...config,
     };
     this._render();
+    if (this._hass && previousRoom !== undefined && previousRoom !== this._config.chatroom_id) {
+      this._init();
+    }
   }
 
   set hass(hass) {
     const firstAssignment = !this._hass;
     this._hass = hass;
+    this._api.hass = hass;
     if (firstAssignment) {
+      hass.connection.addEventListener("ready", this._onReconnect);
       this._init();
     }
+  }
+
+  _refresh() {
+    if (!this._config.chatroom_id) this._fetchRooms();
+    if (this._activeRoomId) this._fetchMessages(this._activeRoomId);
   }
 
   _lang() {
@@ -154,6 +208,7 @@ class K93AnsChatCard extends HTMLElement {
       this._clockInterval = null;
     }
     document.removeEventListener("visibilitychange", this._onVisibilityChange);
+    this._hass?.connection.removeEventListener("ready", this._onReconnect);
     if (this._unsubscribeRoom) {
       this._unsubscribeRoom();
       this._unsubscribeRoom = null;
@@ -161,25 +216,20 @@ class K93AnsChatCard extends HTMLElement {
   }
 
   async _init() {
-    if (this._config.chatroom_id) {
-      await this._selectRoom(this._config.chatroom_id);
-    } else {
-      await this._fetchRooms();
-      if (this._rooms.length) {
-        await this._selectRoom(this._rooms[0].id);
-      }
-    }
+    await this._fetchRooms();
+    const roomId = this._config.chatroom_id || this._rooms[0]?.id;
+    if (roomId) await this._selectRoom(roomId);
   }
 
   async _fetchRooms() {
     try {
-      const result = await this._hass.callWS({ type: "k93_ans/chat/list_rooms" });
+      const result = await this._api.call("chat/list_rooms");
       this._rooms = result.chatrooms || [];
       if (result.reaction_emoji && result.reaction_emoji.length) {
         this._reactionEmoji = result.reaction_emoji;
       }
     } catch (err) {
-      console.error("k93-ans-chat-card: failed to list chatrooms", err);
+      console.error(`${CARD_TAG}: failed to list chatrooms`, err);
       this._rooms = [];
     }
     this._render();
@@ -203,8 +253,7 @@ class K93AnsChatCard extends HTMLElement {
 
   async _fetchMessages(chatroomId) {
     try {
-      const result = await this._hass.callWS({
-        type: "k93_ans/chat/list_messages",
+      const result = await this._api.call("chat/list_messages", {
         chatroom_id: chatroomId,
         limit: Number(this._config.message_limit) || 50,
       });
@@ -219,7 +268,7 @@ class K93AnsChatCard extends HTMLElement {
       this._readStates = [];
       this._accessDenied = Boolean(err && err.code === "access_denied");
       if (!this._accessDenied) {
-        console.error("k93-ans-chat-card: failed to load messages", err);
+        console.error(`${CARD_TAG}: failed to load messages`, err);
       }
     }
     this._render();
@@ -227,16 +276,17 @@ class K93AnsChatCard extends HTMLElement {
 
   async _subscribeRoom(chatroomId) {
     try {
-      this._unsubscribeRoom = await this._hass.connection.subscribeMessage(
+      this._unsubscribeRoom = await this._api.subscribe(
+        "chat/subscribe",
         (msg) => {
           if (msg.message) this._onMessage(msg.message);
           if (msg.read) this._onRead(msg.read);
           if (msg.reaction) this._onReaction(msg.reaction);
         },
-        { type: "k93_ans/chat/subscribe", chatroom_id: chatroomId }
+        { chatroom_id: chatroomId }
       );
     } catch (err) {
-      console.error("k93-ans-chat-card: failed to subscribe", err);
+      console.error(`${CARD_TAG}: failed to subscribe`, err);
     }
   }
 
@@ -251,16 +301,16 @@ class K93AnsChatCard extends HTMLElement {
   }
 
   _onRead(read) {
-    const now = new Date().toISOString();
+    const lastReadAt = read.last_read_at || new Date().toISOString();
     const idx = this._readStates.findIndex((r) => r.user_id === read.user_id);
     if (idx >= 0) {
       this._readStates = [
         ...this._readStates.slice(0, idx),
-        { ...this._readStates[idx], last_read_at: now },
+        { ...this._readStates[idx], last_read_at: lastReadAt, name: read.name || this._readStates[idx].name },
         ...this._readStates.slice(idx + 1),
       ];
     } else {
-      this._readStates = [...this._readStates, { user_id: read.user_id, last_read_at: now }];
+      this._readStates = [...this._readStates, { user_id: read.user_id, name: read.name, last_read_at: lastReadAt }];
     }
     this._render();
   }
@@ -279,23 +329,22 @@ class K93AnsChatCard extends HTMLElement {
   async _toggleReaction(messageId, emoji) {
     if (!this._activeRoomId || !messageId || !emoji) return;
     try {
-      await this._hass.callWS({
-        type: "k93_ans/chat/toggle_reaction",
+      await this._api.call("chat/toggle_reaction", {
         chatroom_id: this._activeRoomId,
         message_id: messageId,
         emoji,
       });
     } catch (err) {
-      console.error("k93-ans-chat-card: failed to toggle reaction", err);
+      console.error(`${CARD_TAG}: failed to toggle reaction`, err);
     }
   }
 
   _maybeMarkRead() {
     if (!this._activeRoomId || !this._hass || !this.isConnected) return;
     if (document.visibilityState !== "visible") return;
-    this._hass
-      .callWS({ type: "k93_ans/chat/mark_read", chatroom_id: this._activeRoomId })
-      .catch((err) => console.error("k93-ans-chat-card: failed marking read", err));
+    this._api
+      .call("chat/mark_read", { chatroom_id: this._activeRoomId })
+      .catch((err) => console.error(`${CARD_TAG}: failed marking read`, err));
   }
 
   async _sendMessage() {
@@ -309,14 +358,14 @@ class K93AnsChatCard extends HTMLElement {
     this._pendingImage = null;
     this._renderComposerPreview();
     try {
-      const payload = { type: "k93_ans/chat/send", chatroom_id: this._activeRoomId, message: text };
+      const payload = { chatroom_id: this._activeRoomId, message: text };
       if (pending) {
         payload.image_base64 = pending.base64;
         payload.image_content_type = pending.contentType;
       }
-      await this._hass.callWS(payload);
+      await this._api.call("chat/send", payload);
     } catch (err) {
-      console.error("k93-ans-chat-card: failed to send message", err);
+      console.error(`${CARD_TAG}: failed to send message`, err);
     } finally {
       if (pending?.previewUrl) URL.revokeObjectURL(pending.previewUrl);
     }
@@ -361,7 +410,7 @@ class K93AnsChatCard extends HTMLElement {
       this._pendingImage = resized;
       this._renderComposerPreview();
     } catch (err) {
-      console.error("k93-ans-chat-card: failed to process image", err);
+      console.error(`${CARD_TAG}: failed to process image`, err);
     }
   }
 
@@ -1049,11 +1098,11 @@ class K93AnsChatCard extends HTMLElement {
   }
 
   static getConfigElement() {
-    return document.createElement("k93-ans-chat-card-editor");
+    return document.createElement(`${CARD_TAG}-editor`);
   }
 }
 
-class K93AnsChatCardEditor extends HTMLElement {
+class SentinelChatCardEditor extends HTMLElement {
   setConfig(config) {
     this._config = config;
     this._updateForm();
@@ -1067,7 +1116,7 @@ class K93AnsChatCardEditor extends HTMLElement {
   connectedCallback() {
     if (!this._form) {
       this._form = document.createElement("ha-form");
-      this._form.computeLabel = (item) => K93AnsChatCardEditor.LABELS[item.name] || item.name;
+      this._form.computeLabel = (item) => SentinelChatCardEditor.LABELS[item.name] || item.name;
       this._form.addEventListener("value-changed", (ev) => {
         ev.stopPropagation();
         this._config = ev.detail.value;
@@ -1082,7 +1131,7 @@ class K93AnsChatCardEditor extends HTMLElement {
       this.appendChild(this._form);
 
       const versionEl = document.createElement("div");
-      versionEl.textContent = `K93 ANS Chat Card v${CARD_VERSION}`;
+      versionEl.textContent = `Sentinel Chat Card v${CARD_VERSION}`;
       versionEl.style.cssText =
         "text-align: right; font-size: 0.75em; opacity: 0.5; padding: 4px 2px 0;";
       this.appendChild(versionEl);
@@ -1098,10 +1147,7 @@ class K93AnsChatCardEditor extends HTMLElement {
         ? cached.attributes.chatrooms
         : (() => {
             for (const stateObj of Object.values(hass.states)) {
-              if (
-                stateObj.entity_id.startsWith("sensor.k93_ans") &&
-                Array.isArray(stateObj.attributes?.chatrooms)
-              ) {
+              if (Array.isArray(stateObj.attributes?.chatrooms)) {
                 this._chatSensorId = stateObj.entity_id;
                 return stateObj.attributes.chatrooms;
               }
@@ -1182,7 +1228,7 @@ class K93AnsChatCardEditor extends HTMLElement {
   }
 }
 
-K93AnsChatCardEditor.LABELS = {
+SentinelChatCardEditor.LABELS = {
   group_room: "Chatroom",
   group_appearance: "Card appearance",
   chatroom_id: "Chatroom (blank = let the viewer choose, if they have access to more than one)",
@@ -1191,12 +1237,14 @@ K93AnsChatCardEditor.LABELS = {
   card_height: "Card height (px, blank = fill the dashboard cell)",
 };
 
-customElements.define("k93-ans-chat-card", K93AnsChatCard);
-customElements.define("k93-ans-chat-card-editor", K93AnsChatCardEditor);
+defineElement(CARD_TAG, SentinelChatCard);
+defineElement(`${CARD_TAG}-editor`, SentinelChatCardEditor);
+defineElement(LEGACY_CARD_TAG, class extends SentinelChatCard {});
+defineElement(`${LEGACY_CARD_TAG}-editor`, class extends SentinelChatCardEditor {});
 
 window.customCards = window.customCards || [];
 window.customCards.push({
-  type: "k93-ans-chat-card",
-  name: "K93 ANS Chat Card",
-  description: "A chatroom card for the k93_ans integration - sender avatars, read receipts, and sending new messages.",
+  type: CARD_TAG,
+  name: "Sentinel Chat Card",
+  description: "A chatroom card for the Sentinel integration - sender avatars, read receipts, and sending new messages.",
 });
