@@ -4,10 +4,11 @@ import { fakeHass, loadCard } from "./harness.mjs";
 
 const card = loadCard(new URL("../sentinel-chat-card.js", import.meta.url).pathname);
 
-test("registers new and legacy element names", () => {
-  for (const tag of ["sentinel-chat-card", "sentinel-chat-card-editor", "k93-ans-chat-card", "k93-ans-chat-card-editor"]) {
+test("registers only the Sentinel element names", () => {
+  for (const tag of ["sentinel-chat-card", "sentinel-chat-card-editor"]) {
     assert.ok(card.defined.has(tag), tag);
   }
+  assert.ok(!card.defined.has("k93-ans-chat-card"));
 });
 
 test("uses the sentinel websocket prefix when available", async () => {

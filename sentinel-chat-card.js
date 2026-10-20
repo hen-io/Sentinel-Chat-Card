@@ -1,7 +1,6 @@
 
-const CARD_VERSION = "0.2.0";
+const CARD_VERSION = "0.2.1";
 const CARD_TAG = "sentinel-chat-card";
-const LEGACY_CARD_TAG = "k93-ans-chat-card";
 
 const LOCALE_TAG = { en: "en", no: "nb-NO" };
 
@@ -1239,8 +1238,6 @@ SentinelChatCardEditor.LABELS = {
 
 defineElement(CARD_TAG, SentinelChatCard);
 defineElement(`${CARD_TAG}-editor`, SentinelChatCardEditor);
-defineElement(LEGACY_CARD_TAG, class extends SentinelChatCard {});
-defineElement(`${LEGACY_CARD_TAG}-editor`, class extends SentinelChatCardEditor {});
 
 window.customCards = window.customCards || [];
 window.customCards.push({
