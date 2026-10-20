@@ -1,5 +1,5 @@
 
-const CARD_VERSION = "0.2.1";
+const CARD_VERSION = "0.2.2";
 const CARD_TAG = "sentinel-chat-card";
 
 const LOCALE_TAG = { en: "en", no: "nb-NO" };
@@ -363,10 +363,19 @@ class SentinelChatCard extends HTMLElement {
         payload.image_content_type = pending.contentType;
       }
       await this._api.call("chat/send", payload);
+      if (pending?.previewUrl) URL.revokeObjectURL(pending.previewUrl);
     } catch (err) {
       console.error(`${CARD_TAG}: failed to send message`, err);
-    } finally {
-      if (pending?.previewUrl) URL.revokeObjectURL(pending.previewUrl);
+      if (!input.value) {
+        input.value = text;
+        this._autosizeInput();
+      }
+      if (pending && !this._pendingImage) {
+        this._pendingImage = pending;
+        this._renderComposerPreview();
+      } else if (pending?.previewUrl) {
+        URL.revokeObjectURL(pending.previewUrl);
+      }
     }
   }
 
