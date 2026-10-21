@@ -1,5 +1,5 @@
 
-const CARD_VERSION = "0.2.2";
+const CARD_VERSION = "0.2.3";
 const CARD_TAG = "sentinel-chat-card";
 
 const LOCALE_TAG = { en: "en", no: "nb-NO" };
@@ -18,6 +18,11 @@ const STRINGS = {
     noRooms: "No chatrooms available.",
     noMessages: "No messages yet.",
     readBy: "Read by",
+    addReaction: "Add reaction",
+    deleteMessage: "Delete message",
+    confirmDelete: "Delete this message?",
+    attachImage: "Attach image",
+    removeImage: "Remove image",
   },
   no: {
     yesterday: "I går",
@@ -27,6 +32,11 @@ const STRINGS = {
     noRooms: "Ingen chatterom tilgjengelig.",
     noMessages: "Ingen meldinger ennå.",
     readBy: "Lest av",
+    addReaction: "Legg til reaksjon",
+    deleteMessage: "Slett melding",
+    confirmDelete: "Slette denne meldingen?",
+    attachImage: "Legg ved bilde",
+    removeImage: "Fjern bilde",
   },
 };
 
@@ -250,13 +260,18 @@ class SentinelChatCard extends HTMLElement {
     this._maybeMarkRead();
   }
 
+  _messageLimit() {
+    return Number(this._config.message_limit) || 50;
+  }
+
   async _fetchMessages(chatroomId) {
     try {
       const result = await this._api.call("chat/list_messages", {
         chatroom_id: chatroomId,
-        limit: Number(this._config.message_limit) || 50,
+        limit: this._messageLimit(),
       });
       this._messages = (result.messages || []).slice().reverse();
+      this._olderExhausted = this._messages.length < this._messageLimit();
       this._readStates = result.read_states || [];
       if (result.reaction_emoji && result.reaction_emoji.length) {
         this._reactionEmoji = result.reaction_emoji;
@@ -273,6 +288,47 @@ class SentinelChatCard extends HTMLElement {
     this._render();
   }
 
+  async _loadOlder() {
+    const roomId = this._activeRoomId;
+    if (this._loadingOlder || this._olderExhausted || !roomId || !this._messages.length) return;
+    this._loadingOlder = true;
+    try {
+      const result = await this._api.call("chat/list_messages", {
+        chatroom_id: roomId,
+        limit: this._messageLimit(),
+        before_id: this._messages[0].id,
+      });
+      if (roomId !== this._activeRoomId) return;
+      const older = (result.messages || []).slice().reverse();
+      this._olderExhausted = older.length < this._messageLimit();
+      const known = new Set(this._messages.map((m) => m.id));
+      const fresh = older.filter((m) => !known.has(m.id));
+      if (fresh.length) {
+        this._preserveScroll = { height: this._messagesEl.scrollHeight, top: this._messagesEl.scrollTop };
+        this._messages = [...fresh, ...this._messages];
+        this._render();
+      }
+    } catch (err) {
+      console.error(`${CARD_TAG}: failed to load older messages`, err);
+    } finally {
+      this._loadingOlder = false;
+    }
+  }
+
+  _onDeleted(deleted) {
+    this._messages = this._messages.filter((m) => m.id !== deleted.message_id);
+    this._render();
+  }
+
+  async _deleteMessage(messageId) {
+    if (!window.confirm(this._str("confirmDelete"))) return;
+    try {
+      await this._api.call("chat/delete_message", { chatroom_id: this._activeRoomId, message_id: messageId });
+    } catch (err) {
+      console.error(`${CARD_TAG}: failed to delete message`, err);
+    }
+  }
+
   async _subscribeRoom(chatroomId) {
     try {
       this._unsubscribeRoom = await this._api.subscribe(
@@ -281,6 +337,7 @@ class SentinelChatCard extends HTMLElement {
           if (msg.message) this._onMessage(msg.message);
           if (msg.read) this._onRead(msg.read);
           if (msg.reaction) this._onReaction(msg.reaction);
+          if (msg.deleted) this._onDeleted(msg.deleted);
         },
         { chatroom_id: chatroomId }
       );
@@ -438,7 +495,7 @@ class SentinelChatCard extends HTMLElement {
     this._composerPreviewEl.hidden = false;
     this._composerPreviewEl.innerHTML =
       `<img src="${esc(this._pendingImage.previewUrl)}" alt="" />` +
-      `<button type="button" class="composer-preview-remove" aria-label="Remove image">×</button>`;
+      `<button type="button" class="composer-preview-remove" aria-label="${esc(this._str("removeImage"))}">×</button>`;
   }
 
   _autosizeInput() {
@@ -543,10 +600,18 @@ class SentinelChatCard extends HTMLElement {
               `<button type="button" data-picker-emoji="${esc(emoji)}" data-message-id="${esc(message.id)}">${esc(emoji)}</button>`
           ).join("")}</div>`
         : "";
+    const user = this._hass?.user;
+    const canDelete = Boolean(user && (message.sender_user_id === user.id || user.is_admin));
+    const deleteHtml = canDelete
+      ? `<button type="button" class="message-action delete-message" data-delete-message="${esc(message.id)}" ` +
+        `title="${esc(this._str("deleteMessage"))}" aria-label="${esc(this._str("deleteMessage"))}">` +
+        `<ha-icon icon="mdi:delete-outline"></ha-icon></button>`
+      : "";
     return (
       `<div class="reaction-corner">` +
-      `<button type="button" class="add-reaction" data-add-reaction="${esc(message.id)}" aria-label="Add reaction">+</button>` +
-      `${picker}</div>`
+      `<button type="button" class="add-reaction" data-add-reaction="${esc(message.id)}" ` +
+      `title="${esc(this._str("addReaction"))}" aria-label="${esc(this._str("addReaction"))}">+</button>` +
+      `${deleteHtml}${picker}</div>`
     );
   }
 
@@ -626,10 +691,14 @@ class SentinelChatCard extends HTMLElement {
   _renderMessages() {
     const html = this._buildMessagesHtml();
     if (html === this._lastMessagesHtml) return;
+    const preserve = this._preserveScroll;
+    this._preserveScroll = null;
     const shouldScroll = this._forceScrollToBottom || this._isScrolledNearBottom();
     this._lastMessagesHtml = html;
     this._messagesEl.innerHTML = html;
-    if (shouldScroll) {
+    if (preserve) {
+      this._messagesEl.scrollTop = this._messagesEl.scrollHeight - preserve.height + preserve.top;
+    } else if (shouldScroll) {
       this._messagesEl.scrollTop = this._messagesEl.scrollHeight;
     }
     this._forceScrollToBottom = false;
@@ -702,23 +771,30 @@ class SentinelChatCard extends HTMLElement {
           overflow-x: auto;
         }
         .room-chip {
+          position: relative;
           display: inline-flex;
           align-items: center;
-          gap: 6px;
-          border: 1px solid var(--divider-color);
+          gap: 8px;
+          height: 32px;
+          box-sizing: border-box;
+          border: 1px solid var(--md-sys-color-outline-variant, var(--divider-color));
           background: transparent;
-          color: var(--primary-text-color);
-          border-radius: 999px;
-          padding: 5px 12px;
+          color: var(--md-sys-color-on-surface-variant, var(--primary-text-color));
+          border-radius: 8px;
+          padding: 0 16px;
           font: inherit;
-          font-size: 0.9em;
+          font-size: 14px;
+          font-weight: 500;
+          letter-spacing: 0.1px;
           cursor: pointer;
           flex-shrink: 0;
         }
         .room-chip.active {
-          background: color-mix(in srgb, var(--primary-color, #0a84ff) 18%, transparent);
-          border-color: var(--primary-color, #0a84ff);
+          background: var(--md-sys-color-secondary-container, color-mix(in srgb, var(--primary-color, #0a84ff) 20%, transparent));
+          color: var(--md-sys-color-on-secondary-container, var(--primary-text-color));
+          border-color: transparent;
         }
+        .room-chip ha-icon { --mdc-icon-size: 18px; }
         .unread-badge {
           display: inline-flex;
           align-items: center;
@@ -868,18 +944,19 @@ class SentinelChatCard extends HTMLElement {
         .reaction-pill {
           display: inline-flex;
           align-items: center;
-          gap: 3px;
-          border: 1px solid var(--divider-color);
+          gap: 4px;
+          height: 24px;
+          box-sizing: border-box;
+          border: 1px solid var(--md-sys-color-outline-variant, var(--divider-color));
           background: transparent;
-          border-radius: 999px;
-          padding: 1px 7px;
+          border-radius: 8px;
+          padding: 0 8px;
           font-size: 0.85em;
-          line-height: 1.7;
           cursor: pointer;
         }
         .reaction-pill.mine {
-          border-color: var(--primary-color, #0a84ff);
-          background: color-mix(in srgb, var(--primary-color, #0a84ff) 16%, transparent);
+          border-color: transparent;
+          background: var(--md-sys-color-secondary-container, color-mix(in srgb, var(--primary-color, #0a84ff) 20%, transparent));
         }
         .reaction-count {
           font-size: 0.85em;
@@ -889,7 +966,31 @@ class SentinelChatCard extends HTMLElement {
           position: absolute;
           bottom: -8px;
           left: -8px;
+          display: flex;
+          gap: 4px;
         }
+        .message.own .reaction-corner {
+          left: auto;
+          right: -8px;
+          flex-direction: row-reverse;
+        }
+        .message-action {
+          display: none;
+          align-items: center;
+          justify-content: center;
+          width: 20px;
+          height: 20px;
+          padding: 0;
+          border: 1px solid var(--md-sys-color-outline-variant, var(--divider-color));
+          border-radius: 50%;
+          background: var(--card-background-color, var(--secondary-background-color, #fff));
+          color: var(--secondary-text-color);
+          cursor: pointer;
+          --mdc-icon-size: 14px;
+        }
+        .bubble:hover .message-action,
+        .message-action:focus-visible { display: inline-flex; }
+        .delete-message:hover { color: var(--error-color, #ff453a); }
         .add-reaction {
           display: inline-flex;
           align-items: center;
@@ -974,13 +1075,16 @@ class SentinelChatCard extends HTMLElement {
           display: inline-flex;
           align-items: center;
           justify-content: center;
-          width: 36px;
-          height: 36px;
-          border: 1px solid var(--divider-color);
-          border-radius: 10px;
+          width: 40px;
+          height: 40px;
+          border: none;
+          border-radius: 50%;
           background: transparent;
-          color: var(--secondary-text-color);
+          color: var(--md-sys-color-on-surface-variant, var(--secondary-text-color));
           cursor: pointer;
+        }
+        .composer-attach:hover {
+          background: color-mix(in srgb, currentColor 8%, transparent);
         }
         .composer-input {
           flex: 1 1 auto;
@@ -989,24 +1093,30 @@ class SentinelChatCard extends HTMLElement {
           max-height: 120px;
           font: inherit;
           color: var(--primary-text-color);
-          background: var(--secondary-background-color, rgba(127, 127, 127, 0.08));
-          border: 1px solid var(--divider-color);
-          border-radius: 10px;
-          padding: 8px 10px;
+          background: var(--md-sys-color-surface-container-highest, var(--secondary-background-color, rgba(127, 127, 127, 0.08)));
+          border: 1px solid transparent;
+          border-radius: 20px;
+          padding: 9px 16px;
+          outline: none;
         }
+        .composer-input:focus { border-color: var(--md-sys-color-primary, var(--primary-color, #0a84ff)); }
         .composer-send {
           flex-shrink: 0;
+          height: 40px;
           border: none;
-          border-radius: 10px;
-          padding: 8px 14px;
-          background: var(--primary-color, #0a84ff);
-          color: #fff;
+          border-radius: 20px;
+          padding: 0 24px;
+          background: var(--md-sys-color-primary, var(--primary-color, #0a84ff));
+          color: var(--md-sys-color-on-primary, var(--text-primary-color, #fff));
           font: inherit;
-          font-weight: 600;
+          font-size: 14px;
+          font-weight: 500;
+          letter-spacing: 0.1px;
           cursor: pointer;
         }
+        .composer-send:hover:not(:disabled) { box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3); }
         .composer-send:disabled {
-          opacity: 0.5;
+          opacity: 0.38;
           cursor: default;
         }
       </style>
@@ -1053,7 +1163,19 @@ class SentinelChatCard extends HTMLElement {
         const chip = ev.target.closest("[data-room-id]");
         if (chip) this._selectRoom(chip.dataset.roomId);
       });
+      this._messagesEl.addEventListener(
+        "scroll",
+        () => {
+          if (this._messagesEl.scrollTop < 60) this._loadOlder();
+        },
+        { passive: true }
+      );
       this._messagesEl.addEventListener("click", (ev) => {
+        const deleteBtn = ev.target.closest("[data-delete-message]");
+        if (deleteBtn) {
+          this._deleteMessage(deleteBtn.dataset.deleteMessage);
+          return;
+        }
         const pill = ev.target.closest("[data-toggle-emoji]");
         if (pill) {
           this._toggleReaction(pill.dataset.messageId, pill.dataset.toggleEmoji);
@@ -1090,6 +1212,8 @@ class SentinelChatCard extends HTMLElement {
     }
     this._inputEl.placeholder = this._str("typeMessage");
     this._sendBtnEl.textContent = this._str("send");
+    this._attachBtnEl.setAttribute("aria-label", this._str("attachImage"));
+    this._attachBtnEl.title = this._str("attachImage");
     this._sendBtnEl.disabled = !this._activeRoomId;
 
     this._renderRoomPicker();
